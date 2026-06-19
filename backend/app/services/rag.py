@@ -66,6 +66,10 @@ def embed_image_file(image_path: str | Path) -> List[float]:
         inputs = {k: v.to(cfg.EMBEDDING_DEVICE) for k, v in inputs.items()}
         with torch.no_grad():
             feats = model.get_image_features(**inputs)
+
+            if not isinstance(feats, torch.Tensor):
+                feats = feats.pooler_output
+
             feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats[0].cpu().tolist()
     except Exception as exc:
@@ -85,8 +89,13 @@ def embed_text(text: str) -> List[float]:
         inputs = {k: v.to(cfg.EMBEDDING_DEVICE) for k, v in inputs.items()}
         with torch.no_grad():
             feats = model.get_text_features(**inputs)
+
+            # Newer transformers return BaseModelOutputWithPooling
+            if not isinstance(feats, torch.Tensor):
+                feats = feats.pooler_output
+
             feats = feats / feats.norm(dim=-1, keepdim=True)
-        return feats[0].cpu().tolist()
+            return feats[0].cpu().tolist()
     except Exception as exc:
         raise EmbeddingError(f"Text embedding failed: {exc}") from exc
 
