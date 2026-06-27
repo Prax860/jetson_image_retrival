@@ -41,7 +41,7 @@ logs/
 *.pem
 
 # Data and generated assets
-
+data/
 uploads/
 tmp/
 temp/

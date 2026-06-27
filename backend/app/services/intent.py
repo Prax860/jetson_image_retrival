@@ -25,6 +25,7 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import IntentExtractionError
 from backend.app.core.logging import get_logger
 from backend.app.models.intent import IntentFilter
+from backend.app.utils.camera_ids import parse_camera_id_from_query
 
 logger = get_logger(__name__)
 
@@ -52,6 +53,7 @@ def _load_llm() -> ChatOllama:
         logger.info("Loading Ollama LLM: model=%s", cfg.LLM_MODEL_NAME)
         _llm = ChatOllama(
             model=cfg.LLM_MODEL_NAME,
+            base_url="http://localhost:11434",
             temperature=cfg.LLM_TEMPERATURE,
             num_predict=cfg.LLM_MAX_TOKENS,
             format="json",          # Ollama native JSON mode — forces valid JSON output
@@ -152,6 +154,17 @@ def extract_intent(query: str) -> IntentFilter:
     try:
         chain = _build_chain()
         result: IntentFilter = chain.invoke({"query": query})
+        logger.info("Raw LLM output: %s", result.model_dump(exclude_none=True))
+
+        raw_camera_id = parse_camera_id_from_query(query)
+        if raw_camera_id and not result.camera_id:
+            result.camera_id = raw_camera_id
+
+        if not result.semantic_query:
+            if result.label:
+                result.semantic_query = result.label
+            else:
+                result.semantic_query = query
         logger.info("Intent extracted: %s", result)
         logger.info("=" * 60)
         return result

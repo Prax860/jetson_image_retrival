@@ -14,6 +14,7 @@ from chromadb.config import Settings as ChromaSettings
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import VectorStoreError
 from backend.app.core.logging import get_logger
+from backend.app.utils.camera_ids import CameraIdFormat, infer_camera_id_format, normalize_camera_id
 
 logger = get_logger(__name__)
 
@@ -40,6 +41,7 @@ class VectorStoreRepository:
             name=cfg.CHROMA_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        self._camera_id_format: Optional[CameraIdFormat] = None
         logger.info(
             "VectorStore ready | collection=%s | count=%d",
             cfg.CHROMA_COLLECTION_NAME,
@@ -55,6 +57,13 @@ class VectorStoreRepository:
         metadata: Dict[str, Any],
     ) -> None:
         try:
+            metadata = dict(metadata)
+            metadata["camera_id"] = self.normalize_camera_id(metadata.get("camera_id")) or ""
+            # Log the camera_id value and its type for debugging normalization issues
+            try:
+                logger.debug("Upsert metadata.camera_id=%r (type=%s)", metadata["camera_id"], type(metadata["camera_id"]).__name__)
+            except Exception:
+                pass
             self._col.upsert(
                 ids=[record_id],
                 embeddings=[embedding],
@@ -102,8 +111,25 @@ class VectorStoreRepository:
         cameras: set[str] = set()
         for m in (result.get("metadatas") or []):
             if m and m.get("camera_id"):
-                cameras.add(m["camera_id"])
+                normalized = self.normalize_camera_id(m["camera_id"])
+                if normalized:
+                    cameras.add(normalized)
         return sorted(cameras)
+
+    def camera_id_format(self) -> CameraIdFormat:
+        """Infer and cache the camera-id format currently stored in Chroma."""
+        if self._camera_id_format is None:
+            result = self._col.get(include=["metadatas"])
+            samples: list[str] = []
+            for m in (result.get("metadatas") or []):
+                if m and m.get("camera_id"):
+                    samples.append(str(m["camera_id"]))
+            self._camera_id_format = infer_camera_id_format(samples)
+            logger.info("Detected camera_id storage format: %s", self._camera_id_format.describe())
+        return self._camera_id_format
+
+    def normalize_camera_id(self, camera_id: object) -> Optional[str]:
+        return normalize_camera_id(camera_id, self.camera_id_format())
 
     def delete(self, record_id: str) -> None:
         self._col.delete(ids=[record_id])
@@ -115,6 +141,7 @@ class VectorStoreRepository:
             name=cfg.CHROMA_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        self._camera_id_format = None
         logger.warning("Collection reset.")
 
 

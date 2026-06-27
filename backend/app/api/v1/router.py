@@ -38,7 +38,7 @@ from backend.app.schemas.alert import (
 )
 from backend.app.services.ingest import ingest_alert
 from backend.app.services.rag import index_record
-from backend.app.services.query_pipeline import run_query  # ← replaces direct search_alerts
+from backend.app.services.query_pipeline import run_query
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -55,7 +55,8 @@ VSDep = Annotated[VectorStoreRepository, Depends(get_vector_store)]
     summary="Push an alert image from a Jetson device",
     description=(
         "Accepts a multipart/form-data upload with the image file and metadata fields. "
-        "The server saves the image, embeds it with CLIP, and stores the vector in Chroma."
+        "The server saves the image, writes a metadata JSON, embeds with CLIP, "
+        "and stores the vector in Chroma."
     ),
 )
 async def ingest_endpoint(
@@ -67,10 +68,18 @@ async def ingest_endpoint(
     confidence: Optional[float] = Form(None, description="Detection confidence 0–1"),
     location_label: Optional[str] = Form(None, description="Human-readable camera location"),
     extra_json: Optional[str] = Form(
-        None,
-        description="Any additional metadata as a JSON object string",
+        None, description="Any additional metadata as a JSON object string"
+    ),
+    # ── NEW: Jetson detection fields ──────────────────────────────────────────
+    label: Optional[str] = Form(None, description="Detection class label, e.g. 'person'"),
+    frame_num: Optional[int] = Form(None, description="Frame number in the video stream"),
+    object_id: Optional[int] = Form(None, description="Tracker object ID"),
+    class_id: Optional[int] = Form(None, description="Numeric class index from detector"),
+    bbox: Optional[str] = Form(
+        None, description="Bounding box as JSON: {left, top, width, height}"
     ),
 ) -> IngestResponse:
+    # Parse extra_json
     extra: dict = {}
     if extra_json:
         try:
@@ -79,6 +88,17 @@ async def ingest_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"extra_json is not valid JSON: {exc}",
+            )
+
+    # Parse bbox JSON string → dict
+    bbox_dict: Optional[dict] = None
+    if bbox:
+        try:
+            bbox_dict = json.loads(bbox)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"bbox is not valid JSON: {exc}",
             )
 
     image_bytes = await image.read()
@@ -98,6 +118,12 @@ async def ingest_endpoint(
             confidence=confidence,
             location_label=location_label,
             extra=extra,
+            # new fields
+            label=label,
+            frame_num=frame_num,
+            object_id=object_id,
+            class_id=class_id,
+            bbox=bbox_dict,
         )
     except IngestError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -147,7 +173,6 @@ async def search_endpoint(
         )
 
     except IntentExtractionError as exc:
-        # LLM failed to load (hard failure — model file missing, OOM, etc.)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Intent extraction unavailable: {exc}",
@@ -180,6 +205,14 @@ async def search_endpoint(
             image_filename=r.record.image_filename,
             image_b64=r.image_b64,
             extra=r.record.extra,
+            # new fields surfaced to the frontend
+            label=r.record.label,
+            frame_num=r.record.frame_num,
+            object_id=r.record.object_id,
+            class_id=r.record.class_id,
+            bbox=r.record.bbox,
+            caption=r.record.caption,
+            ocr=r.record.ocr,
         )
         for r in results
     ]
@@ -188,8 +221,6 @@ async def search_endpoint(
         query=body.query,
         total=len(items),
         results=items,
-        # surface the extracted filters so clients/UI can show
-        # "Searching camera 2 · label: person · after 15:00"
         applied_filters=intent.model_dump(exclude_none=True, exclude={"semantic_query"}),
         semantic_query=intent.semantic_query,
     )

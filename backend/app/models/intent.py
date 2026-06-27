@@ -78,14 +78,24 @@ class IntentFilter(BaseModel):
 
     # ── Semantic field ────────────────────────────────────────────────────────
 
-    semantic_query: str = Field(
+    semantic_query: Optional[str] = Field(
+        default=None,
         description=(
             "Cleaned description passed to CLIP for vector similarity search. "
-            "Strip time/camera references — keep visual semantics only."
+            "If omitted by the LLM, it will be derived from the label or original query."
         ),
     )
 
     # ── Validators ────────────────────────────────────────────────────────────
+
+    @field_validator("camera_id", "label", "alert_type", mode="before")
+    @classmethod
+    def _empty_to_none(cls, v: object) -> Optional[str]:
+        """Convert empty strings to None so downstream code can use `if field`."""
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
 
     @field_validator("time_after", "time_before", mode="before")
     @classmethod
@@ -114,15 +124,6 @@ class IntentFilter(BaseModel):
         if len(s) != 10 or s[4] != "-" or s[7] != "-":  # noqa: PLR2004
             raise ValueError(f"Invalid date format: {s!r}. Expected YYYY-MM-DD.")
         return s
-
-    @field_validator("camera_id", "label", "alert_type", mode="before")
-    @classmethod
-    def _empty_to_none(cls, v: object) -> Optional[str]:
-        """Convert empty strings to None so downstream code can use `if field`."""
-        if v is None:
-            return None
-        s = str(v).strip()
-        return s if s else None
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

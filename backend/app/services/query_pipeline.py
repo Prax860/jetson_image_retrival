@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+import re
 from typing import Any, Dict, List, Optional
 
 from backend.app.core.config import get_settings
@@ -30,6 +31,7 @@ from backend.app.models.alert import SearchResult
 from backend.app.models.intent import IntentFilter
 from backend.app.repositories.vector_store import VectorStoreRepository
 from backend.app.services.intent import extract_intent
+from backend.app.utils.camera_ids import parse_camera_id_from_query
 from backend.app.services.retrieval import search_alerts
 
 logger = get_logger(__name__)
@@ -82,16 +84,33 @@ def run_query(
 
     # ── Step 1: Intent extraction ─────────────────────────────────────────────
     intent = extract_intent(query)
-    logger.info("Intent: %r", intent)
+    logger.info("Original query: %s", query)
+    # If the LLM omitted the camera_id entirely (or failed), try a lightweight
+    # regex-based extraction from the raw query so simple inputs like "cam2"
+    # still produce a metadata filter.
+    if not intent.camera_id:
+        raw_cam = parse_camera_id_from_query(query)
+        if raw_cam:
+            logger.info("Parsed camera_id from query fallback: %s", raw_cam)
+            intent = intent.model_copy(update={"camera_id": raw_cam})
+    logger.info("Raw LLM output (post-fallback): %s", intent.model_dump(exclude_none=True))
 
     # ── Step 2: Build Chroma where-clause ────────────────────────────────────
-    where = _build_where_clause(intent)
-    logger.info("Chroma where-clause: %s", where)
+    normalized_intent = _normalize_intent(intent, vector_store, query)
+    logger.info("Normalized IntentFilter: %s", normalized_intent)
+
+    if _is_trivial_query(query) and not normalized_intent.has_metadata_filters():
+        logger.info("Generated where clause: None")
+        logger.info("Number of results: 0")
+        return HybridQueryResult(results=[], intent=normalized_intent, where_clause=None)
+
+    where = _build_where_clause(normalized_intent, vector_store)
+    logger.info("Generated where clause: %s", where)
 
     # ── Step 3: Hybrid retrieval ──────────────────────────────────────────────
     try:
         results = search_alerts(
-            query=intent.semantic_query,
+            query=normalized_intent.semantic_query,
             vector_store=vector_store,
             top_k=k,
             min_score=min_score,
@@ -106,13 +125,14 @@ def run_query(
         where,
         len(results),
     )
+    logger.info("Number of results: %d", len(results))
 
-    return HybridQueryResult(results=results, intent=intent, where_clause=where)
+    return HybridQueryResult(results=results, intent=normalized_intent, where_clause=where)
 
 
 # ── Chroma filter builder ─────────────────────────────────────────────────────
 
-def _build_where_clause(intent: IntentFilter) -> Optional[Dict[str, Any]]:
+def _build_where_clause(intent: IntentFilter, vector_store: Optional[VectorStoreRepository] = None) -> Optional[Dict[str, Any]]:
     """
     Translate an IntentFilter into a Chroma `where` dict.
 
@@ -136,7 +156,42 @@ def _build_where_clause(intent: IntentFilter) -> Optional[Dict[str, Any]]:
 
     # Exact-match filters
     if intent.camera_id:
-        conditions.append({"camera_id": {"$eq": intent.camera_id}})
+        cam = intent.camera_id
+        # Always include the normalized string form
+        cam_conditions: List[Dict[str, Any]] = [{"camera_id": {"$eq": cam}}]
+
+        # If the camera looks numeric, check whether stored Chroma metadata
+        # uses integers for camera_id; if so, include an integer equality
+        # branch to match both representations. We only attempt this when a
+        # `vector_store` is available with a `._col.get()` method to avoid
+        # touching external systems in unit tests.
+        try:
+            if str(cam).isdigit() and vector_store is not None and hasattr(vector_store, "_col"):
+                # Inspect a small sample of stored metadatas to detect int types
+                try:
+                    sample = vector_store._col.get(include=["metadatas"]) or {}
+                    metas = sample.get("metadatas") or []
+                    found_int = False
+                    for m in metas:
+                        if m is None:
+                            continue
+                        c = m.get("camera_id")
+                        if isinstance(c, int):
+                            found_int = True
+                            break
+                    if found_int:
+                        cam_int = int(str(cam))
+                        cam_conditions.append({"camera_id": {"$eq": cam_int}})
+                except Exception:
+                    # If anything goes wrong inspecting the collection, skip int branch
+                    pass
+        except Exception:
+            pass
+
+        if len(cam_conditions) == 1:
+            conditions.append(cam_conditions[0])
+        else:
+            conditions.append({"$or": cam_conditions})
 
     if intent.label:
         conditions.append({"label": {"$eq": intent.label}})
@@ -165,6 +220,51 @@ def _build_where_clause(intent: IntentFilter) -> Optional[Dict[str, Any]]:
         return None
 
     return {"$and": conditions} if len(conditions) > 1 else conditions[0]
+
+
+def _normalize_intent(
+    intent: IntentFilter,
+    vector_store: VectorStoreRepository,
+    query: str,
+) -> IntentFilter:
+    """Normalize intent fields to the camera format already stored in Chroma."""
+    updates: Dict[str, Any] = {}
+
+    if intent.camera_id:
+        normalized_camera_id = vector_store.normalize_camera_id(intent.camera_id)
+        if normalized_camera_id and normalized_camera_id != intent.camera_id:
+            updates["camera_id"] = normalized_camera_id
+
+    if not intent.semantic_query:
+        updates["semantic_query"] = intent.label or intent.camera_id or intent.alert_type or query
+
+    if not updates:
+        return intent
+
+    return intent.model_copy(update=updates)
+
+
+def _is_trivial_query(query: str) -> bool:
+    """Return True for greeting-style queries that should not trigger search."""
+    tokens = re.findall(r"[a-z0-9]+", query.lower())
+    if not tokens:
+        return True
+
+    trivial_tokens = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "thanks",
+        "thank",
+        "you",
+        "please",
+        "morning",
+        "afternoon",
+        "evening",
+        "there",
+    }
+    return len(tokens) <= 3 and all(token in trivial_tokens for token in tokens)
 
 
 def _build_timestamp_range(

@@ -14,7 +14,9 @@ def client():
     mock_vs.count.return_value = 0
     mock_vs.list_cameras.return_value = []
 
-    with patch("backend.app.repositories.vector_store.get_vector_store", return_value=mock_vs):
+    # Use `new=` with a lambda to avoid Mock objects exposing a (*args, **kwargs)
+    # signature which FastAPI would interpret as required query params.
+    with patch("backend.app.repositories.vector_store.get_vector_store", new=lambda: mock_vs):
         from backend.app.main import app
         with TestClient(app) as c:
             yield c

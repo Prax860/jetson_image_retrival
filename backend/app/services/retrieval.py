@@ -5,12 +5,10 @@ Takes a natural-language query, embeds it with CLIP, queries Chroma,
 and returns SearchResult objects that include the base64-encoded image
 so the Streamlit UI can render them directly.
 
-Change from original
---------------------
-`search_alerts` now accepts an optional `where` parameter (a pre-built
-Chroma filter dict).  When supplied by query_pipeline.py it takes
-precedence over the legacy `camera_id` / `alert_type` keyword arguments,
-which are kept for backwards compatibility.
+After Chroma returns matching ids, the canonical metadata is loaded from
+data/metadata/<id>.json so the full record (bbox, frame_num, etc.) is
+available to the frontend.  Chroma metadata is used only as a fallback
+when the JSON file is missing.
 """
 
 from __future__ import annotations
@@ -24,9 +22,10 @@ from typing import Any, Dict, List, Optional
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import RetrievalError
 from backend.app.core.logging import get_logger
-from backend.app.models.alert import AlertRecord, SearchResult
+from backend.app.models.alert import AlertRecord, BBox, SearchResult
 from backend.app.repositories.vector_store import VectorStoreRepository
 from backend.app.services.rag import embed_text
+from backend.app.utils.metadata import load_metadata
 
 logger = get_logger(__name__)
 
@@ -38,9 +37,7 @@ def search_alerts(
     camera_id: Optional[str] = None,
     alert_type: Optional[str] = None,
     min_score: float = 0.0,
-    # ── NEW ────────────────────────────────────────────────────────────────
     where: Optional[Dict[str, Any]] = None,
-    # ── END NEW ────────────────────────────────────────────────────────────
 ) -> List[SearchResult]:
     """
     Semantic search over indexed alert images.
@@ -56,8 +53,6 @@ def search_alerts(
                   Applied as Python post-filter when `where` is supplied.
     min_score:    Cosine similarity threshold in [0, 1].
     where:        Pre-built Chroma where-clause dict (from query_pipeline.py).
-                  When present, `camera_id` is not used for the Chroma query;
-                  all metadata filtering has already been encoded in `where`.
 
     Returns
     -------
@@ -72,21 +67,16 @@ def search_alerts(
 
     logger.info(
         "Search | query=%r | top_k=%d | where=%s | camera=%s",
-        query,
-        k,
-        where,
-        camera_id or "*",
+        query, k, where, camera_id or "*",
     )
 
     # 1. Embed the query
     query_vector = embed_text(query)
 
-    # 2. Resolve the Chroma where-clause.
-    #    `where` from query_pipeline.py takes precedence.
-    #    Fall back to the legacy single-field filter for direct callers.
+    # 2. Resolve the Chroma where-clause
     chroma_where = where
     if chroma_where is None and camera_id:
-        chroma_where = {"camera_id": camera_id}
+        chroma_where = {"camera_id": vector_store.normalize_camera_id(camera_id) or camera_id}
 
     # 3. Fetch from vector store (over-fetch to allow post-filtering)
     fetch_k = min(k * 4, cfg.MAX_TOP_K * 4)
@@ -99,28 +89,38 @@ def search_alerts(
     logger.info("=" * 70)
     logger.info("Query: %s", query)
     for meta, score in raw:
+        cam_val = meta.get("camera_id")
         logger.info(
-            "%.4f | camera=%s | label=%s",
-            score,
-            meta.get("camera_id"),
-            meta.get("label"),
+            "%.4f | camera=%s (%s) | label=%s",
+            score, cam_val, type(cam_val).__name__, meta.get("label"),
         )
     logger.info("=" * 70)
 
-    # 4. Build results with optional Python-side secondary filters
+    # 4. Build results, loading full metadata from JSON
     results: List[SearchResult] = []
     rank = 1
 
-    for meta, score in raw:
+    for chroma_meta, score in raw:
         if score < min_score:
             continue
 
-        # Secondary filter: alert_type (not always expressible in the where-
-        # clause when combined with other $and conditions)
-        if alert_type and meta.get("alert_type", "") != alert_type:
+        record_id = chroma_meta.get("id", "")
+
+        # Load canonical metadata; fall back to Chroma metadata if missing
+        full_meta = load_metadata(record_id) if record_id else {}
+        if not full_meta:
+            logger.warning(
+                "metadata.json missing for id=%s — falling back to Chroma metadata",
+                record_id,
+            )
+            full_meta = chroma_meta
+
+        record = _meta_to_record(full_meta, vector_store.normalize_camera_id)
+
+        # Secondary Python-side filter on alert_type
+        if alert_type and record.alert_type != alert_type:
             continue
 
-        record = _meta_to_record(meta)
         image_b64 = _load_image_b64(record.image_path)
 
         results.append(
@@ -136,27 +136,60 @@ def search_alerts(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _meta_to_record(meta: dict) -> AlertRecord:
-    extra_raw = meta.get("extra", "{}")
-    try:
-        extra = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
-    except Exception:
-        extra = {}
+def _meta_to_record(meta: dict, camera_id_normalizer) -> AlertRecord:
+    """Construct an AlertRecord from a metadata dict (JSON or Chroma fallback)."""
 
+    # confidence: stored as -1.0 sentinel when absent
     confidence_raw = meta.get("confidence", -1.0)
-    confidence = float(confidence_raw) if float(confidence_raw) >= 0 else None
+    try:
+        confidence = float(confidence_raw) if float(confidence_raw) >= 0 else None
+    except (TypeError, ValueError):
+        confidence = None
+
+    # extra: may be a JSON string (Chroma) or already a dict (JSON file)
+    extra_raw = meta.get("extra", {})
+    if isinstance(extra_raw, str):
+        try:
+            extra_raw = json.loads(extra_raw)
+        except Exception:
+            extra_raw = {}
+
+    # bbox: may be a dict or None
+    bbox_raw = meta.get("bbox")
+    bbox_model: Optional[BBox] = None
+    if isinstance(bbox_raw, dict):
+        try:
+            bbox_model = BBox(**bbox_raw)
+        except Exception:
+            pass
+
+    # indexed_at: may be absent in legacy records
+    indexed_at_raw = meta.get("indexed_at")
+    try:
+        indexed_at = datetime.fromisoformat(indexed_at_raw) if indexed_at_raw else datetime.utcnow()
+    except Exception:
+        indexed_at = datetime.utcnow()
 
     return AlertRecord(
         id=meta.get("id", ""),
         image_path=meta.get("image_path", ""),
         image_filename=meta.get("image_filename", ""),
-        camera_id=meta.get("camera_id", ""),
+        camera_id=camera_id_normalizer(meta.get("camera_id", "")) or str(meta.get("camera_id", "")),
         timestamp=datetime.fromisoformat(meta["timestamp"]),
         alert_type=meta.get("alert_type") or None,
         confidence=confidence,
         location_label=meta.get("location_label") or None,
-        extra=extra,
-        indexed_at=datetime.fromisoformat(meta["indexed_at"]),
+        extra=extra_raw,
+        # new fields (present in JSON, absent in legacy Chroma fallback)
+        label=meta.get("label") or None,
+        frame_num=meta.get("frame_num"),
+        object_id=meta.get("object_id"),
+        class_id=meta.get("class_id"),
+        bbox=bbox_model,
+        caption=meta.get("caption", ""),
+        ocr=meta.get("ocr", ""),
+        metadata_path=meta.get("metadata_path"),
+        indexed_at=indexed_at,
     )
 
 
