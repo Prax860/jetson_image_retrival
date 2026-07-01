@@ -25,6 +25,7 @@ from backend.app.core.logging import get_logger
 from backend.app.models.alert import AlertRecord, BBox, SearchResult
 from backend.app.repositories.vector_store import VectorStoreRepository
 from backend.app.services.rag import embed_text
+from backend.app.services.highlight import highlight_image_b64
 from backend.app.utils.metadata import load_metadata
 
 logger = get_logger(__name__)
@@ -38,6 +39,7 @@ def search_alerts(
     alert_type: Optional[str] = None,
     min_score: float = 0.0,
     where: Optional[Dict[str, Any]] = None,
+    original_query: Optional[str] = None,
 ) -> List[SearchResult]:
     """
     Semantic search over indexed alert images.
@@ -53,6 +55,9 @@ def search_alerts(
                   Applied as Python post-filter when `where` is supplied.
     min_score:    Cosine similarity threshold in [0, 1].
     where:        Pre-built Chroma where-clause dict (from query_pipeline.py).
+    original_query: Raw user query before intent parsing. Used as the
+                  highlight prompt (color/garment parsing happens inside
+                  highlight.py). Falls back to *query* if omitted.
 
     Returns
     -------
@@ -76,7 +81,7 @@ def search_alerts(
     # 2. Resolve the Chroma where-clause
     chroma_where = where
     if chroma_where is None and camera_id:
-        chroma_where = {"camera_id": vector_store.normalize_camera_id(camera_id) or camera_id}
+        chroma_where = {"camera_id": camera_id}
 
     # 3. Fetch from vector store (over-fetch to allow post-filtering)
     fetch_k = min(k * 4, cfg.MAX_TOP_K * 4)
@@ -89,10 +94,9 @@ def search_alerts(
     logger.info("=" * 70)
     logger.info("Query: %s", query)
     for meta, score in raw:
-        cam_val = meta.get("camera_id")
         logger.info(
-            "%.4f | camera=%s (%s) | label=%s",
-            score, cam_val, type(cam_val).__name__, meta.get("label"),
+            "%.4f | camera=%s | label=%s",
+            score, meta.get("camera_id"), meta.get("label"),
         )
     logger.info("=" * 70)
 
@@ -115,13 +119,31 @@ def search_alerts(
             )
             full_meta = chroma_meta
 
-        record = _meta_to_record(full_meta, vector_store.normalize_camera_id)
+        record = _meta_to_record(full_meta)
 
         # Secondary Python-side filter on alert_type
         if alert_type and record.alert_type != alert_type:
             continue
 
         image_b64 = _load_image_b64(record.image_path)
+
+        # Highlight matching person(s) via YOLO person detection + CLIP
+        # zero-shot color classification (see highlight.py for the full
+        # pipeline). record_bbox is passed for call-signature compatibility
+        # but is intentionally IGNORED inside highlight_image_b64 — stored
+        # metadata bboxes are (a) computed at ingest time with no relation
+        # to any color/attribute named in a later search query, and (b) can
+        # be pixel-misaligned with this image if it was resized between the
+        # Jetson and this backend. Every box drawn is computed fresh on the
+        # actual image bytes below.
+        highlight_query = original_query or query
+        if image_b64:
+            record_bbox = record.bbox.model_dump() if record.bbox else None
+            image_b64 = highlight_image_b64(
+                image_b64,
+                highlight_query,
+                record_bbox=record_bbox,
+            )
 
         results.append(
             SearchResult(record=record, score=round(score, 4), rank=rank, image_b64=image_b64)
@@ -136,7 +158,7 @@ def search_alerts(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _meta_to_record(meta: dict, camera_id_normalizer) -> AlertRecord:
+def _meta_to_record(meta: dict) -> AlertRecord:
     """Construct an AlertRecord from a metadata dict (JSON or Chroma fallback)."""
 
     # confidence: stored as -1.0 sentinel when absent
@@ -174,7 +196,7 @@ def _meta_to_record(meta: dict, camera_id_normalizer) -> AlertRecord:
         id=meta.get("id", ""),
         image_path=meta.get("image_path", ""),
         image_filename=meta.get("image_filename", ""),
-        camera_id=camera_id_normalizer(meta.get("camera_id", "")) or str(meta.get("camera_id", "")),
+        camera_id=meta.get("camera_id", ""),
         timestamp=datetime.fromisoformat(meta["timestamp"]),
         alert_type=meta.get("alert_type") or None,
         confidence=confidence,

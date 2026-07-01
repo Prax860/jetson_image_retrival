@@ -22,7 +22,6 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import IngestError
 from backend.app.core.logging import get_logger
 from backend.app.models.alert import AlertRecord, BBox
-from backend.app.utils.camera_ids import infer_existing_camera_id_format, normalize_camera_id
 from backend.app.utils.metadata import save_metadata
 
 logger = get_logger(__name__)
@@ -68,7 +67,6 @@ def ingest_alert(
     AlertRecord with image_path and metadata_path populated.
     """
     cfg = get_settings()
-    camera_id = normalize_camera_id(camera_id, infer_existing_camera_id_format()) or camera_id.strip()
 
     # 1. Extension check
     suffix = Path(original_filename).suffix.lower()

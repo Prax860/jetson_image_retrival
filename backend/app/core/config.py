@@ -9,7 +9,6 @@ from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -18,49 +17,78 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── App ───────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # App
+    # ─────────────────────────────────────────────────────────────
+
     APP_NAME: str = "Imagify"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
-    # ── Server ────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Server
+    # ─────────────────────────────────────────────────────────────
+
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
-    # ── Storage ───────────────────────────────────────────────────────────────
-    IMAGE_STORE_DIR: Path = Path("./data/images")
-    CHROMA_PERSIST_DIR: Path = Path("./data/chroma")
+    # ─────────────────────────────────────────────────────────────
+    # Storage
+    # ─────────────────────────────────────────────────────────────
+
+    DATA_DIR: Path = Path("./data")
+
+    IMAGE_STORE_DIR: Path = DATA_DIR / "images"
+    METADATA_DIR: Path = DATA_DIR / "metadata"
+
+    CHROMA_PERSIST_DIR: Path = DATA_DIR / "chroma"
     CHROMA_COLLECTION_NAME: str = "imagify_alerts"
 
-    # ── CLIP ──────────────────────────────────────────────────────────────────
-    CLIP_MODEL_NAME: str = "openai/clip-vit-base-patch32"
-    EMBEDDING_DEVICE: str = "cpu"   # set to "cuda" on GPU machine
+    # ─────────────────────────────────────────────────────────────
+    # CLIP
+    # ─────────────────────────────────────────────────────────────
 
-    # ── Upload limits ─────────────────────────────────────────────────────────
+    CLIP_MODEL_NAME: str = "openai/clip-vit-base-patch32"
+    EMBEDDING_DEVICE: str = "cpu"      # "cuda" on GPU
+
+    # ─────────────────────────────────────────────────────────────
+    # Upload
+    # ─────────────────────────────────────────────────────────────
+
     MAX_IMAGE_SIZE_MB: float = 20.0
+
     ALLOWED_IMAGE_EXTENSIONS: List[str] = [
-        ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+        ".tiff",
     ]
 
-    # ── Retrieval ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Retrieval
+    # ─────────────────────────────────────────────────────────────
+
     DEFAULT_TOP_K: int = 10
     MAX_TOP_K: int = 50
 
-    # ── LLM (intent extraction) ───────────────────────────────────────────────
-    # Point at any GGUF model file on disk, e.g. Mistral-7B-Instruct.
-    # The model is loaded once as a singleton; see services/intent.py.
-    # LLM_MODEL_PATH: Path = Path("./models/mistral-7b-instruct-v0.2.Q4_K_M.gguf")
-    # LLM_GPU_LAYERS: int = 0    # 0 = CPU-only; set to 32+ to offload layers to GPU
-    # # ── Query Understanding ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Ollama / Intent Extraction
+    # ─────────────────────────────────────────────────────────────
 
     LLM_MODEL_NAME: str = "qwen2.5:1.5b"
+
+    OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
 
     LLM_TEMPERATURE: float = 0.0
 
     LLM_MAX_TOKENS: int = 256
 
-    QUERY_PROMPT_PATH: Path = Path("Imagify\\backend\\app\\prompts\\query_parser.txt")
+    QUERY_PROMPT_PATH: Path = Path(
+        "backend/app/prompts/query_parser.txt"
+    )
 
 
 @lru_cache(maxsize=1)

@@ -4,28 +4,48 @@ services:
   api:
     build: .
     container_name: imagify-api
+
     ports:
       - "8000:8000"
+
     volumes:
-      - ./data:/app/data        # persists images + chroma index
+      - ./data:/app/data
       - ./.env:/app/.env
+
     environment:
       - EMBEDDING_DEVICE=cpu
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+    # Allows the container to reach services running on the Windows host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     restart: unless-stopped
 
   frontend:
     image: python:3.11-slim
     container_name: imagify-frontend
+
     working_dir: /app
+
     command: >
-      bash -c "pip install streamlit requests --quiet &&
-               streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0"
+      bash -c "
+      pip install streamlit requests --quiet &&
+      streamlit run frontend/app.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      "
+
     volumes:
       - ./frontend:/app/frontend
+
     ports:
       - "8501:8501"
+
     environment:
       - IMAGIFY_API_URL=http://api:8000
+
     depends_on:
       - api
+
     restart: unless-stopped

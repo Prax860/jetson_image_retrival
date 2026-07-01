@@ -24,6 +24,10 @@ Rules:
 6. camera_id should contain only the camera number without the word "camera" or "cam".
 7. confidence_min should be a decimal between 0 and 1 if specified.
 8. Preserve the user's intent.
+9. Use "person" for people, human, man, woman, boy, girl, pedestrian.
+10. Use "vehicle" for car, truck, bus, bike, motorcycle unless a more specific label exists.
+11. If the user asks for clothing, appearance, colors, accessories, poses, actions, or other visual attributes, keep those in semantic_query.
+12. If the query contains only metadata filters (camera/date/time), semantic_query should be an empty string "".
 
 Example 1
 
@@ -31,7 +35,7 @@ User:
 Show all persons from camera 2
 
 Output:
-{
+{{
   "camera_id": "2",
   "label": "person",
   "alert_type": null,
@@ -39,7 +43,7 @@ Output:
   "timestamp_end": null,
   "confidence_min": null,
   "semantic_query": "person"
-}
+}}
 
 Example 2
 
@@ -47,7 +51,7 @@ User:
 Show vehicles after 3 PM
 
 Output:
-{
+{{
   "camera_id": null,
   "label": "vehicle",
   "alert_type": null,
@@ -55,7 +59,7 @@ Output:
   "timestamp_end": null,
   "confidence_min": null,
   "semantic_query": "vehicle"
-}
+}}
 
 Example 3
 
@@ -63,7 +67,7 @@ User:
 Show people with backpacks
 
 Output:
-{
+{{
   "camera_id": null,
   "label": "person",
   "alert_type": null,
@@ -71,6 +75,73 @@ Output:
   "timestamp_end": null,
   "confidence_min": null,
   "semantic_query": "person with backpack"
-}
+}}
+
+Example 4
+
+User:
+Show images from camera 4
+
+Output:
+{{
+  "camera_id": "4",
+  "label": null,
+  "alert_type": null,
+  "timestamp_start": null,
+  "timestamp_end": null,
+  "confidence_min": null,
+  "semantic_query": ""
+}}
+
+Example 5
+
+User:
+Show people wearing red shirts from camera 2
+
+Output:
+{{
+  "camera_id": "2",
+  "label": "person",
+  "alert_type": null,
+  "timestamp_start": null,
+  "timestamp_end": null,
+  "confidence_min": null,
+  "semantic_query": "person wearing red shirt"
+}}
+
+Example 6
+
+User:
+Show bald people
+
+Output:
+{{
+  "camera_id": null,
+  "label": "person",
+  "alert_type": null,
+  "timestamp_start": null,
+  "timestamp_end": null,
+  "confidence_min": null,
+  "semantic_query": "bald person"
+}}
+
+Example 7
+
+User:
+Show white car from camera 3 after 5 PM
+
+Output:
+{{
+  "camera_id": "3",
+  "label": "vehicle",
+  "alert_type": null,
+  "timestamp_start": "17:00",
+  "timestamp_end": null,
+  "confidence_min": null,
+  "semantic_query": "white car"
+}}
 
 Now convert the following user query into JSON.
+
+User:
+{query}

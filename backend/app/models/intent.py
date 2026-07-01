@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class IntentFilter(BaseModel):
@@ -63,14 +63,17 @@ class IntentFilter(BaseModel):
     )
     time_after: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("time_after", "timestamp_start"),
         description="Lower bound on time-of-day in HH:MM (24-h), e.g. '15:00'.",
     )
     time_before: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("time_before", "timestamp_end"),
         description="Upper bound on time-of-day in HH:MM (24-h), e.g. '18:00'.",
     )
     min_confidence: Optional[float] = Field(
         default=None,
+        validation_alias=AliasChoices("min_confidence", "confidence_min"),
         ge=0.0,
         le=1.0,
         description="Minimum detection confidence in [0, 1].",
@@ -114,16 +117,34 @@ class IntentFilter(BaseModel):
     @field_validator("date", mode="before")
     @classmethod
     def _normalise_date(cls, v: object) -> Optional[str]:
-        """Accept 'YYYY-MM-DD' or None."""
+        """
+        Accept any recognisable date string and normalise to YYYY-MM-DD.
+
+        Previously this validator only accepted strings already in YYYY-MM-DD
+        format — anything else silently became None because the ValueError was
+        swallowed by Pydantic.  Now we call parse_date() first so natural
+        language like "27 june" or "yesterday" is resolved before the
+        structural check.
+        """
         if v is None:
             return None
         s = str(v).strip()
         if not s:
             return None
-        # Basic structural check — full ISO parsing happens in query_pipeline
-        if len(s) != 10 or s[4] != "-" or s[7] != "-":  # noqa: PLR2004
-            raise ValueError(f"Invalid date format: {s!r}. Expected YYYY-MM-DD.")
-        return s
+
+        # Fast path: already in YYYY-MM-DD format
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":  # noqa: PLR2004
+            return s
+
+        # Slow path: try to parse natural-language date
+        from backend.app.utils.date_parser import parse_date  # local import avoids circularity
+        parsed = parse_date(s)
+        if parsed:
+            return parsed
+
+        # If nothing matched, raise so Pydantic sets the field to None
+        # (consistent with the original behaviour for truly unrecognisable values)
+        raise ValueError(f"Unrecognisable date: {s!r}. Expected YYYY-MM-DD or natural language.")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

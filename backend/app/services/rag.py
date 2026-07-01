@@ -131,7 +131,7 @@ def index_record(
     # bbox, frame_num, object_id, class_id, extra stay in JSON only.
     chroma_metadata = {
         "id":             record.id,
-        "camera_id":      vector_store.normalize_camera_id(record.camera_id) or record.camera_id,
+        "camera_id":      record.camera_id,
         "timestamp":      record.timestamp.isoformat(),
         # Prefer JSON value (already persisted) → AlertRecord field → empty string
         "label":          meta.get("label") or record.label or "",
@@ -145,4 +145,4 @@ def index_record(
     }
 
     vector_store.upsert(record.id, embedding, chroma_metadata)
-    logger.info("Indexed alert %s (camera=%s)", record.id, chroma_metadata["camera_id"])
+    logger.info("Indexed alert %s (camera=%s)", record.id, record.camera_id)

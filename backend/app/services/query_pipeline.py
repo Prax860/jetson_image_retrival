@@ -115,7 +115,8 @@ def run_query(
             top_k=k,
             min_score=min_score,
             where=where,            # pre-built filter — retrieval.py passes it
-        )                           # straight through to Chroma
+            original_query=query,
+        )
     except Exception as exc:
         raise QueryPipelineError(f"Retrieval failed: {exc}") from exc
 

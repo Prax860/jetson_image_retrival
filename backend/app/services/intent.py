@@ -25,7 +25,6 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import IntentExtractionError
 from backend.app.core.logging import get_logger
 from backend.app.models.intent import IntentFilter
-from backend.app.utils.camera_ids import parse_camera_id_from_query
 
 logger = get_logger(__name__)
 
@@ -154,11 +153,6 @@ def extract_intent(query: str) -> IntentFilter:
     try:
         chain = _build_chain()
         result: IntentFilter = chain.invoke({"query": query})
-        logger.info("Raw LLM output: %s", result.model_dump(exclude_none=True))
-
-        raw_camera_id = parse_camera_id_from_query(query)
-        if raw_camera_id and not result.camera_id:
-            result.camera_id = raw_camera_id
 
         if not result.semantic_query:
             if result.label:

@@ -88,7 +88,7 @@ def _render_results(results: List[Dict[str, Any]]) -> None:
                 if b64:
                     st.image(
                         f"data:image/jpeg;base64,{b64}",
-                        use_column_width=True,
+                        width="stretch",
                         caption=f"Rank #{item['rank']} · score {item['score']:.3f}",
                     )
                 else:
