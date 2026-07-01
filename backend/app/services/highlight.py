@@ -28,6 +28,7 @@ metadata. Two independent problems with that:
 So the pipeline now ALWAYS computes fresh boxes on the actual image bytes
 in hand:
     1. Detect every person in the frame with a real object detector (YOLO).
+       (Shared with the attribute-verification stage — see detection.py.)
     2. Crop each detected person.
     3. Zero-shot classify each crop's clothing color with CLIP
        (crop embedding vs. a small set of color-prompt text embeddings).
@@ -54,6 +55,7 @@ from PIL import Image, ImageDraw
 from backend.app.core.config import get_settings
 from backend.app.core.logging import get_logger
 from backend.app.services.rag import _load_clip
+from backend.app.services.detection import detect_persons as _detect_persons
 
 logger = get_logger(__name__)
 
@@ -66,96 +68,11 @@ _MAX_BOX_AREA_RATIO = 0.20
 _MIN_BOX_SIDE_RATIO = 0.03
 _MAX_BOX_SIDE_RATIO = 0.55
 
-# ── Person detector (YOLO) ────────────────────────────────────────────────────
-_YOLO_MODEL_NAME = "yolov8n.pt"   # tiny, fast, CPU-friendly
-_YOLO_PERSON_CLASS_ID = 0          # COCO class 0 = "person"
-_YOLO_CONF_THRESHOLD = 0.35
-
-_yolo_model = None
-
-
-def _load_yolo():
-    """Lazily load and cache the YOLO person detector."""
-    global _yolo_model
-    if _yolo_model is None:
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise RuntimeError(
-                "ultralytics is not installed. Run `pip install ultralytics` "
-                "to enable person detection."
-            ) from exc
-        logger.info("Loading YOLO person detector: %s", _YOLO_MODEL_NAME)
-        _yolo_model = YOLO(_YOLO_MODEL_NAME)
-        logger.info("YOLO ready.")
-    return _yolo_model
-
-
-_YOLO_MIN_INPUT_SIZE = 640  # YOLOv8's native training resolution
-
-
-def _detect_persons(img: Image.Image) -> List[Tuple[int, int, int, int]]:
-    """
-    Run YOLO on the image and return person bounding boxes as
-    (x1, y1, x2, y2) in the CURRENT (original) image's pixel coordinates.
-    Always computed fresh on the actual bytes in hand — never taken from
-    stored metadata, which may be stale relative to this (possibly resized)
-    image.
-
-    Small-image handling: YOLOv8 was trained at 640px. If the incoming
-    image's longer side is well below that (common with resized/thumbnail
-    alert images), person detection recall drops sharply — a person that's
-    only ~30px tall is very easy to miss. We upscale before detection and
-    map boxes back to the original image's coordinate space, which
-    noticeably helps recall on small inputs. This does NOT recover detail
-    that was lost when the image was originally downscaled (garbage in,
-    garbage out) — if your source images are consistently this small,
-    that's a separate upstream problem worth fixing at ingest time.
-    """
-    orig_w, orig_h = img.size
-    scale = 1.0
-    detect_img = img
-
-    longer_side = max(orig_w, orig_h)
-    if longer_side < _YOLO_MIN_INPUT_SIZE:
-        scale = _YOLO_MIN_INPUT_SIZE / longer_side
-        new_size = (int(round(orig_w * scale)), int(round(orig_h * scale)))
-        try:
-            resample_method = Image.Resampling.LANCZOS
-        except AttributeError:
-            resample_method = Image.LANCZOS
-        detect_img = img.resize(new_size, resample_method)
-        logger.info(
-            "Upscaling small image %dx%d -> %dx%d before YOLO (scale=%.2f)",
-            orig_w, orig_h, new_size[0], new_size[1], scale,
-        )
-
-    model = _load_yolo()
-    results = model.predict(
-        source=detect_img,
-        classes=[_YOLO_PERSON_CLASS_ID],
-        conf=_YOLO_CONF_THRESHOLD,
-        verbose=False,
-    )
-
-    boxes: List[Tuple[int, int, int, int]] = []
-    for r in results:
-        if r.boxes is None:
-            continue
-        for b in r.boxes:
-            xyxy = b.xyxy[0].tolist()
-            # Map back to ORIGINAL image coordinates if we upscaled.
-            x1, y1, x2, y2 = (v / scale for v in xyxy)
-            x1, y1, x2, y2 = (int(round(v)) for v in (x1, y1, x2, y2))
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(orig_w - 1, x2)
-            y2 = min(orig_h - 1, y2)
-            if x2 > x1 and y2 > y1:
-                boxes.append((x1, y1, x2, y2))
-
-    logger.info("YOLO detected %d person(s) in %dx%d image", len(boxes), orig_w, orig_h)
-    return boxes
+# Note: YOLO model loading and person detection now live in
+# backend/app/services/detection.py, shared with the attribute-
+# verification stage (verifiers/color_verifier.py). `_detect_persons`
+# above is that shared function, imported under its old local name so
+# the rest of this file (_match_persons_by_color, etc.) is unchanged.
 
 
 # ── Query parsing: extract requested color + garment ─────────────────────────
@@ -506,6 +423,13 @@ def _match_persons_by_color(
     this function. So when detection comes back empty, we classify the
     WHOLE image as if it were the person crop, rather than silently
     dropping a real result.
+
+    Note: this whole-image fallback is specific to the *visualization*
+    path (drawing a box). The verification path (verifiers/color_verifier.py)
+    deliberately does NOT do this — it returns UNKNOWN instead, since a
+    wrongly-confident box drawn here is a cosmetic issue, whereas a
+    wrongly-confident MATCH/NO_MATCH in verification silently changes
+    which images the user sees at all.
     """
     person_boxes = _detect_persons(img)
 

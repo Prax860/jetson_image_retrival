@@ -21,6 +21,13 @@ import streamlit as st
 API_URL = os.getenv("IMAGIFY_API_URL", "http://localhost:8000")
 API_BASE = f"{API_URL}/api/v1"
 
+# HTTP timeout knobs (seconds)
+# - connect timeout: fail fast when backend is unreachable
+# - read timeout: allow slower search/reranking pipelines to finish
+API_CONNECT_TIMEOUT_S = float(os.getenv("IMAGIFY_API_CONNECT_TIMEOUT_S", "5"))
+API_READ_TIMEOUT_S = float(os.getenv("IMAGIFY_API_READ_TIMEOUT_S", "180"))
+API_STATS_TIMEOUT_S = float(os.getenv("IMAGIFY_API_STATS_TIMEOUT_S", "5"))
+
 st.set_page_config(
     page_title="Imagify — Alert Search",
     page_icon="🎥",
@@ -31,7 +38,10 @@ st.set_page_config(
 
 def _get_stats() -> Optional[Dict[str, Any]]:
     try:
-        r = requests.get(f"{API_BASE}/collections", timeout=5)
+        r = requests.get(
+            f"{API_BASE}/collections",
+            timeout=(API_CONNECT_TIMEOUT_S, API_STATS_TIMEOUT_S),
+        )
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -56,9 +66,19 @@ def _search(
         payload["alert_type"] = alert_type
 
     try:
-        r = requests.post(f"{API_BASE}/search", json=payload, timeout=30)
+        r = requests.post(
+            f"{API_BASE}/search",
+            json=payload,
+            timeout=(API_CONNECT_TIMEOUT_S, API_READ_TIMEOUT_S),
+        )
         r.raise_for_status()
         return r.json()
+    except requests.Timeout:
+        st.error(
+            "Search timed out while waiting for backend processing. "
+            "Try again, reduce Max results, or increase IMAGIFY_API_READ_TIMEOUT_S."
+        )
+        return None
     except requests.HTTPError as exc:
         st.error(f"Search failed: {exc.response.text}")
         return None

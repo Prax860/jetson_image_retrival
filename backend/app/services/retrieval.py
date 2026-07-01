@@ -2,12 +2,25 @@
 Retrieval service.
 
 Takes a natural-language query, embeds it with CLIP, queries Chroma,
-and returns SearchResult objects that include the base64-encoded image
-so the Streamlit UI can render them directly.
+runs a generic attribute-verification re-ranking pass over the
+candidates (see reranker.py / verifiers/), and returns SearchResult
+objects that include the base64-encoded image so the Streamlit UI can
+render them directly.
+
+Candidate pool sizing:
+    - If the query names a verifiable attribute (color/object/etc.),
+      CLIP's role shifts from "final ranker" to "candidate gatherer" —
+      we fetch every image matching `where` (up to _MAX_VERIFICATION_POOL)
+      so a low CLIP score can't silently hide a real match from the
+      verifier. Verification (with its NO_MATCH/UNKNOWN distinction) is
+      what actually decides relevance in this mode.
+    - Otherwise (plain queries like "camera 5", "show all persons"),
+      behavior and cost are unchanged from the original implementation:
+      a small over-fetch pool, no verification pass.
 
 After Chroma returns matching ids, the canonical metadata is loaded from
 data/metadata/<id>.json so the full record (bbox, frame_num, etc.) is
-available to the frontend.  Chroma metadata is used only as a fallback
+available to the frontend. Chroma metadata is used only as a fallback
 when the JSON file is missing.
 """
 
@@ -19,6 +32,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from PIL import Image
+
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import RetrievalError
 from backend.app.core.logging import get_logger
@@ -26,9 +41,41 @@ from backend.app.models.alert import AlertRecord, BBox, SearchResult
 from backend.app.repositories.vector_store import VectorStoreRepository
 from backend.app.services.rag import embed_text
 from backend.app.services.highlight import highlight_image_b64
+from backend.app.services.reranker import maybe_rerank_by_attribute
+from backend.app.services.verifiers.registry import parse_attribute_query
 from backend.app.utils.metadata import load_metadata
 
 logger = get_logger(__name__)
+
+# Fallback candidate pool for plain (non-attribute) queries — matches the
+# original implementation's over-fetch factor, keeps cost/behavior
+# identical when nothing is verified.
+_DEFAULT_CANDIDATE_POOL = 20
+
+# Hard ceiling even in "verify everything" mode, so a runaway query can't
+# force-open/verify an unbounded number of images in one request. Raise
+# this (or move it into Settings) if your collection legitimately exceeds it.
+_MAX_VERIFICATION_POOL = 2000
+
+
+def _collection_size(vector_store: VectorStoreRepository, where: Optional[Dict[str, Any]]) -> Optional[int]:
+    """
+    Best-effort count of documents matching `where` (or the whole
+    collection if where is None). Returns None if the repository doesn't
+    expose the underlying Chroma collection, so callers can fall back
+    gracefully instead of crashing.
+    """
+    col = getattr(vector_store, "_col", None)
+    if col is None:
+        return None
+    try:
+        if where:
+            got = col.get(where=where, include=[])
+            return len(got.get("ids") or [])
+        return col.count()
+    except Exception as exc:
+        logger.warning("Could not determine collection size for exhaustive fetch: %s", exc)
+        return None
 
 
 def search_alerts(
@@ -42,7 +89,8 @@ def search_alerts(
     original_query: Optional[str] = None,
 ) -> List[SearchResult]:
     """
-    Semantic search over indexed alert images.
+    Semantic search over indexed alert images, with a second-stage
+    attribute-verification re-rank on top of CLIP similarity.
 
     Parameters
     ----------
@@ -56,12 +104,13 @@ def search_alerts(
     min_score:    Cosine similarity threshold in [0, 1].
     where:        Pre-built Chroma where-clause dict (from query_pipeline.py).
     original_query: Raw user query before intent parsing. Used as the
-                  highlight prompt (color/garment parsing happens inside
-                  highlight.py). Falls back to *query* if omitted.
+                  highlight/verification prompt (attribute parsing happens
+                  inside verifiers/registry.py). Falls back to *query* if
+                  omitted.
 
     Returns
     -------
-    List of SearchResult sorted by descending similarity, each with a
+    List of SearchResult sorted by descending final_score, each with a
     base64-encoded image ready for rendering.
     """
     cfg = get_settings()
@@ -70,9 +119,16 @@ def search_alerts(
     if not query.strip():
         raise RetrievalError("Query must not be empty.")
 
+    highlight_query = original_query or query
+
+    # Parse up front — this alone decides fetch-pool sizing and whether
+    # verification runs later. Purely text-based, no side effects.
+    attribute_query = parse_attribute_query(highlight_query)
+
     logger.info(
-        "Search | query=%r | top_k=%d | where=%s | camera=%s",
+        "Search | query=%r | top_k=%d | where=%s | camera=%s | attribute=%s",
         query, k, where, camera_id or "*",
+        attribute_query.value if attribute_query else None,
     )
 
     # 1. Embed the query
@@ -83,8 +139,20 @@ def search_alerts(
     if chroma_where is None and camera_id:
         chroma_where = {"camera_id": camera_id}
 
-    # 3. Fetch from vector store (over-fetch to allow post-filtering)
-    fetch_k = min(k * 4, cfg.MAX_TOP_K * 4)
+    # 3. Decide fetch pool size
+    if attribute_query is not None:
+        total = _collection_size(vector_store, chroma_where)
+        if total is None:
+            # Repository doesn't support counting — fall back to the hard
+            # ceiling rather than the old small pool, since the whole
+            # point of this mode is "don't let CLIP prematurely truncate".
+            fetch_k = _MAX_VERIFICATION_POOL
+        else:
+            fetch_k = min(max(total, 1), _MAX_VERIFICATION_POOL)
+        logger.info("Exhaustive fetch mode (attribute query) | fetch_k=%d", fetch_k)
+    else:
+        fetch_k = min(max(k * 4, _DEFAULT_CANDIDATE_POOL), cfg.MAX_TOP_K * 4)
+
     raw = vector_store.query(
         query_embedding=query_vector,
         top_k=fetch_k,
@@ -92,7 +160,7 @@ def search_alerts(
     )
 
     logger.info("=" * 70)
-    logger.info("Query: %s", query)
+    logger.info("Query: %s | fetched %d candidates", query, len(raw))
     for meta, score in raw:
         logger.info(
             "%.4f | camera=%s | label=%s",
@@ -100,17 +168,16 @@ def search_alerts(
         )
     logger.info("=" * 70)
 
-    # 4. Build results, loading full metadata from JSON
-    results: List[SearchResult] = []
-    rank = 1
-
+    # 4. Resolve full metadata + apply score/alert_type filters, build
+    #    lightweight candidate structs (image not yet base64-encoded/boxed
+    #    — that's deferred until after reranking so we don't waste work on
+    #    candidates that end up discarded by verification).
+    candidates: List[_Candidate] = []
     for chroma_meta, score in raw:
         if score < min_score:
             continue
 
         record_id = chroma_meta.get("id", "")
-
-        # Load canonical metadata; fall back to Chroma metadata if missing
         full_meta = load_metadata(record_id) if record_id else {}
         if not full_meta:
             logger.warning(
@@ -121,42 +188,83 @@ def search_alerts(
 
         record = _meta_to_record(full_meta)
 
-        # Secondary Python-side filter on alert_type
         if alert_type and record.alert_type != alert_type:
             continue
 
-        image_b64 = _load_image_b64(record.image_path)
+        candidates.append(_Candidate(record=record, clip_score=score))
 
-        # Highlight matching person(s) via YOLO person detection + CLIP
-        # zero-shot color classification (see highlight.py for the full
-        # pipeline). record_bbox is passed for call-signature compatibility
-        # but is intentionally IGNORED inside highlight_image_b64 — stored
-        # metadata bboxes are (a) computed at ingest time with no relation
-        # to any color/attribute named in a later search query, and (b) can
-        # be pixel-misaligned with this image if it was resized between the
-        # Jetson and this backend. Every box drawn is computed fresh on the
-        # actual image bytes below.
-        highlight_query = original_query or query
-        if image_b64:
-            record_bbox = record.bbox.model_dump() if record.bbox else None
-            image_b64 = highlight_image_b64(
-                image_b64,
-                highlight_query,
-                record_bbox=record_bbox,
-            )
+    # 5. Attribute verification + generic re-rank (no-op if attribute_query
+    #    is None — see reranker.py / verifiers/registry.py).
+    reranked = maybe_rerank_by_attribute(
+        query=highlight_query,
+        candidates=candidates,
+        get_image=_candidate_image,
+        get_clip_score=lambda c: c.clip_score,
+    )
 
-        results.append(
-            SearchResult(record=record, score=round(score, 4), rank=rank, image_b64=image_b64)
-        )
-        rank += 1
+    # 6. Build final SearchResults for the top_k re-ranked candidates only.
+    results: List[SearchResult] = []
+    rank = 1
+    for reranked_candidate in reranked:
         if rank > k:
             break
+        candidate = reranked_candidate.item
+        record = candidate.record
 
-    logger.info("Returned %d results for query %r", len(results), query)
+        image_b64 = _load_image_b64(record.image_path)
+        if image_b64:
+            record_bbox = record.bbox.model_dump() if record.bbox else None
+            image_b64 = highlight_image_b64(image_b64, highlight_query, record_bbox=record_bbox)
+
+        results.append(
+            SearchResult(
+                record=record,
+                score=round(reranked_candidate.final_score, 4),
+                rank=rank,
+                image_b64=image_b64,
+            )
+        )
+        rank += 1
+
+    logger.info(
+        "Returned %d results for query %r (candidates evaluated=%d, verified=%s)",
+        len(results), query, len(candidates), attribute_query is not None,
+    )
     return results
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Candidate helpers ─────────────────────────────────────────────────────────
+
+class _Candidate:
+    """Lightweight holder used only during the retrieval/verification pass."""
+
+    __slots__ = ("record", "clip_score", "_pil_image", "_image_loaded")
+
+    def __init__(self, record: AlertRecord, clip_score: float):
+        self.record = record
+        self.clip_score = clip_score
+        self._pil_image = None
+        self._image_loaded = False
+
+
+def _candidate_image(candidate: "_Candidate") -> Optional[Image.Image]:
+    """Lazily load and cache the PIL image for a candidate (verification only)."""
+    if candidate._image_loaded:
+        return candidate._pil_image
+    candidate._image_loaded = True
+    path = Path(candidate.record.image_path)
+    if not path.exists():
+        logger.warning("Image file not found for verification: %s", path)
+        return None
+    try:
+        candidate._pil_image = Image.open(path).convert("RGB")
+    except Exception as exc:
+        logger.error("Cannot open image %s for verification: %s", path, exc)
+        candidate._pil_image = None
+    return candidate._pil_image
+
+
+# ── Helpers (unchanged from the original implementation) ─────────────────────
 
 def _meta_to_record(meta: dict) -> AlertRecord:
     """Construct an AlertRecord from a metadata dict (JSON or Chroma fallback)."""
